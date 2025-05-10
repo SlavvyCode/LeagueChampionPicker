@@ -1,54 +1,17 @@
 #!/usr/bin/env python3
-"""
-lol_counter_live.py – live counter-pick helper filtered to your champion pool.
-
-Highlights
-----------
-• Fetches U.GG first; if that fails, falls back to LoLalytics (or vice-versa via --source).
-• For LoLalytics the displayed number is the ENEMY champ's win-rate; we invert it so
-  you see *your* champ’s win-rate vs the enemy (labelled accordingly).
-
-Usage
------
-python lol_counter_live.py --enemy Yorick                # ask for lane & pool file
-python lol_counter_live.py --enemy Quinn --role top --pool pool.txt
-python lol_counter_live.py --enemy Darius --source lolalytics
-"""
-
+import json, re
+import os
+import hashlib
 import argparse, pathlib, re, sys, time
 from typing import List, Tuple
 import requests
 from bs4 import BeautifulSoup
 from tabulate import tabulate
-OPGG_SLUGS = {
-    "cho'gath": "chogath",
-    "k'sante": "ksante",
-    "ksante": "ksante",
-    "dr. mundo": "drmundo",
-    "lee sin": "leesin",
-    "tahm kench": "tahmkench",
-    "tahm": "tahmkench",
-    "twisted fate": "twistedfate",
-    "miss fortune": "missfortune",
-    "master yi": "masteryi",
-    "jarvan iv": "jarvaniv",
-    "renata glasc": "renata",
-    "bel'veth": "belveth",
-    "kai'sa": "kaisa",
-    "vel'koz": "velkoz",
-    "velkoz": "velkoz",
-    "nunu & willump": "nunu",
-    "rek'sai": "reksai",
-    "kha'zix": "khazix",
-    "leblanc": "leblanc",
-    "xin zhao": "xinzhao",
-    "aurelion sol": "aurelionsol",
-    "yuumi": "yuumi",
-}
 
-
-def slugify_for_opgg(name: str) -> str:
-    return OPGG_SLUGS.get(name, name.lower().replace(" ", "").replace("'", "").replace(".", ""))
+CACHE_PERIOD = 60 * 60 * 24 * 3  # 3 days
+CACHE_DIR = ".cache"
+PARSED_CACHE_DIR = ".parsed_cache"
+os.makedirs(PARSED_CACHE_DIR, exist_ok=True)
 
 HEADERS = {
     "User-Agent": (
@@ -63,56 +26,10 @@ HEADERS = {
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
-
-LANE_KEYS = {
-    "gd10":  ("goldDiff10",   100),   # stored as +123 gold
-    "xpd10": ("xpDiff10",     1),     # stored as +95 xp
-    "csd15": ("csDiff15",     1),     # stored as +12 cs
-    "solokill": ("soloKills", 100),   # stored as 0.0823  → 8.23 %
-}
-
-def parse_lolalytics_adv(html: str) -> dict[str, dict]:
-    """
-    Return  {champ: {'wr': 53.2, 'gd10': 240, 'xpd10': 120, ...}}
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    blob = soup.find("script", id="__NEXT_DATA__")
-    if not blob:
-        raise RuntimeError("No NEXT_DATA in LoLalytics page")
-
-    data = json.loads(blob.string)
-    out = {}
-
-    # the counters array sits at props.pageProps.data.counters
-    counters = (
-        data["props"]["pageProps"]["data"]["counters"]
-        if "props" in data else []
-    )
-    for entry in counters:
-        champ = entry["key"]
-        win   = round(entry["winRate"] * 100, 2)        # 0.524 → 52.4 %
-        stats = {"wr": win}
-        for label, (json_key, scale) in LANE_KEYS.items():
-            raw = entry.get(json_key)
-            if raw is not None:
-                stats[label] = round(raw * scale, 2)
-        out[champ] = stats
-    return out
-
-def lane_score(d):          # d is one champ’s dict from step 2
-    # simple weighted model – tweak to taste
-    return (
-            (d.get("gd10", 0) / 100)   +      #  +1 per 100 g
-            (d.get("xpd10", 0) / 100)  +      #  +1 per 100 xp
-            (d.get("csd15", 0) * 0.1)  +      #  +0.1 per CS
-            (d.get("solokill", 0) * 0.5)      #  +0.5 per 1 % solo-kill
-    )
-
-# ------------------------------------------------ helpers
 def slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9-]", "", name.lower().replace(" ", "-").replace("'", ""))
 
-def load_pool(path: pathlib.Path) -> set[str]:
+def get_user_champ_pool(path: pathlib.Path) -> frozenset[str]:
     if not path.exists():
         sys.exit(f"champion-pool file '{path}' not found")
     return {c.strip().lower() for c in path.read_text().splitlines() if c.strip()}
@@ -125,39 +42,38 @@ def prompt_missing(ns):
     # if not ns.pool:
     #     d = "champion_pool.txt"
     #     ns.pool = input(f"Champion-pool file [{d}]: ").strip() or d
+
         ns.role = "top"
         ns.pool = "champion_pool.txt"
 
 
 
 
-# ------------------------------------------------ U.GG
-def fetch_ugg(enemy: str, role: str) -> str:
+def fetch_ugg(enemy: str, role: str, use_cache=True) -> str:
+    if not use_cache:
+        return _fetch_ugg_direct(enemy, role)
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    key = f"{enemy.lower()}_{role.lower()}"
+    path = os.path.join(CACHE_DIR, hashlib.md5(key.encode()).hexdigest() + ".html")
+
+    if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < CACHE_PERIOD:
+        return open(path, "r", encoding="utf-8").read()
+
+    html = _fetch_ugg_direct(enemy, role)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return html
+
+def _fetch_ugg_direct(enemy, role):
     url = f"https://u.gg/lol/champions/{slugify(enemy)}/counter?role={role}"
-
     r = requests.get(url, headers=HEADERS, timeout=10)
-
-    if r.status_code != 200:
-        raise RuntimeError(f"U.GG HTTP {r.status_code}")
+    r.raise_for_status()
     return r.text
 
-import json, re
-from typing import List, Tuple
-from bs4 import BeautifulSoup
 
-def _walk_json(node, out):
-    """Depth-first search through a nested JSON tree.
-       Collect (champ, winRate) pairs when we see them."""
-    if isinstance(node, dict):
-        if "championName" in node and "winRate" in node:
-            champ = node["championName"].strip()
-            wr    = node["winRate"] * 100          # 0.5862 → 58.62
-            out.append((champ, round(wr, 2)))
-        for v in node.values():
-            _walk_json(v, out)
-    elif isinstance(node, list):
-        for item in node:
-            _walk_json(item, out)
+
+
 
 def extract_balanced_json(html: str, key: str) -> dict:
     start = html.find(key)
@@ -205,7 +121,7 @@ def extract_lane_matchups(ssr_data: dict) -> list[tuple[str, float, float]]:
         if "matchups" not in url:
             continue
         for key, value in block.get("data", {}).items():
-            if key == "world_emerald_plus_top":
+            if key == get_rank_and_role_name("top"):
                 matchup_block = value["counters"]
     if not matchup_block:
         raise RuntimeError("Lane matchup block not found")
@@ -229,121 +145,159 @@ def parse_ugg(html: str) -> dict[str, dict]:
         for champ, wr, gd in raw_pairs
     }
 
+def load_parsed_ugg(enemy: str, role: str) -> dict[str, dict]:
+    key = f"{enemy.lower()}_{role.lower()}"
+    path = os.path.join(PARSED_CACHE_DIR, key + ".json")
+
+    if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < CACHE_PERIOD:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    html = fetch_ugg(enemy, role)
+    parsed = parse_ugg(html)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(parsed, f)
+    return parsed
 
 
-def _dfs_extract_counters(node, out):
+
+
+
+def get_best_blindpick_ugg(role: str, pool: frozenset[str], meta_champs: frozenset[str], rank: str = "gold") -> list[tuple[str, float]]:
+    scores = {}  # {champ_in_pool: [winrates vs each meta champ]}
+
+    for enemy in meta_champs:
+        try:
+            pairs = load_parsed_ugg(enemy, role)
+            for champ, stats in pairs.items():
+                champ = champ.lower()
+                if champ in pool:
+                    scores.setdefault(champ, []).append(stats["wr"])
+        except Exception:
+            continue
+
+    # Compute average winrate across meta champs matchups
+    return sorted(
+        [(champ.title(), sum(wrs)/len(wrs)) for champ, wrs in scores.items() if wrs],
+        key=lambda x: -x[1]
+    )
+
+
+def get_least_bad_blindpick_ugg(role: str, pool: frozenset[str], meta_champs: frozenset[str]) -> list[tuple[str, float]]:
+    scores = {}
+    for enemy in meta_champs:
+        try:
+            pairs = load_parsed_ugg(enemy, role)
+            for champ, stats in pairs.items():
+                champ = champ.lower()
+                if champ in pool:
+                    scores.setdefault(champ, []).append(stats["wr"])
+        except Exception:
+            continue
+
+    return sorted(
+        [(champ.title(), min(wrs)) for champ, wrs in scores.items() if wrs],
+        key=lambda x: -x[1]
+    )
+
+
+def get_rank_and_role_name(role):
+    return f"world_emerald_plus_{role.lower()}"
+
+
+def find_role_data(data: dict, role_key: str) -> dict:
+    for block in data.values():
+        if isinstance(block, dict):
+            section = block.get("data")
+            if isinstance(section, dict):
+                role_data = section.get(role_key)
+                if isinstance(role_data, dict):
+                    return role_data
+    return {}
+
+def get_meta_champs_ugg(role: str, count: int = 15) -> frozenset[str]:
     """
-    Depth-first walk through u.gg __NEXT_DATA__ JSON to find counters.
-    Looks for championName + winRate float (0.5325 = 53.25%).
+    Get the top 'count' champs for a given role from U.GG,
+    based on pickrate and winrate.
     """
-    if isinstance(node, dict):
-        if "championName" in node and "winRate" in node:
-            name = node["championName"]
-            wr = node["winRate"]
-            if isinstance(name, str) and isinstance(wr, (int, float)):
-                out.append((name.strip(), round(wr * 100, 2)))
-        for val in node.values():
-            _dfs_extract_counters(val, out)
-    elif isinstance(node, list):
-        for item in node:
-            _dfs_extract_counters(item, out)
-
-
-# ------------------------------------------------ LoLalytics
-def fetch_lolalytics(enemy: str, role: str) -> str:
-    url = f"https://lolalytics.com/lol/{slugify(enemy)}/counters/"
-    if role.lower() != "top":
-        url += f"?lane={role.lower()}"
+    url = f"https://u.gg/lol/champions/yorick/counter?rank=emerald_plus&role={role.lower()}"
     r = requests.get(url, headers=HEADERS, timeout=10)
     if r.status_code != 200:
-        raise RuntimeError(f"LoLalytics HTTP {r.status_code}")
-    return r.text
+        raise RuntimeError(f"U.GG meta data HTTP {r.status_code}")
 
-def parse_lolalytics(html: str) -> List[Tuple[str, float]]:
-    soup = BeautifulSoup(html, "html.parser")
-    rows = []
-    # each card has champion name + win-rate (enemy's) in a green span
-    for card in soup.select('div[class*="h-[254px]"]'):
-        name_div = card.find("div", class_=re.compile(r"text-\[15px\]"))
-        wr_div = card.find("div", class_=re.compile(r"text-green-300"))
-        if name_div and wr_div:
-            champ = name_div.text.strip()
-            enemy_wr = float(re.search(r"([\d.]+)", wr_div.text).group(1))
-            my_wr = round(100.0 - enemy_wr, 2)  # invert
-            rows.append((champ, my_wr))
-    if not rows:
-        raise RuntimeError("LoLalytics layout changed (no cards)")
-    return rows
+    data = extract_balanced_json(r.text, "window.__SSR_DATA__")
 
+    champ_id_to_name = {}
+    meta_stats = []
 
-import requests
-from bs4 import BeautifulSoup
-from typing import List, Tuple
-import re
+    for key, block in data.items():
+        if "seo-champion-names.json" in key:
+            champ_id_to_name = {
+                int(cid): info.get("name")
+                for cid, info in block.get("data", {}).items()
+                if info.get("name")
+            }
+            break
 
-def parse_opgg(html: str) -> List[Tuple[str, float]]:
-    soup = BeautifulSoup(html, "html.parser")
-    rows = []
+    if not champ_id_to_name:
+        raise RuntimeError("Champion ID-to-name map missing")
 
-    for li in soup.select("ul > li"):
-        champ_tag = li.find("img", alt=True)
-        wr_tag = li.find("strong", class_=re.compile(r"text-.*"))
-
-        if champ_tag and wr_tag:
-            champ = champ_tag["alt"].strip()
-            wr_match = re.search(r"([\d.]+)%", wr_tag.text)
-            if wr_match:
-                enemy_wr = float(wr_match.group(1))
-                my_wr = round(100 - enemy_wr, 2)
-                rows.append((champ, my_wr))
-
-    if not rows:
-        raise RuntimeError("OP.GG: No valid counters found")
-    return sorted(rows, key=lambda x: -x[1])  # sort by your winrate descending
+    role_key = get_rank_and_role_name(role)
+    role_data = find_role_data(data, role_key)
 
 
-# ------------------------------------------------ main
+    for champ in role_data.get("counters", []):
+        cid = champ.get("champion_id")
+        if cid is None or cid not in champ_id_to_name:
+            continue
+
+        name = champ_id_to_name[cid]
+        win = champ.get("win_rate", 0)
+        pick = champ.get("pick_rate", 0)
+        tier = champ.get("tier", {})
+
+        # score formula can be tuned
+        score = (pick +
+                (win - 50) * 0.25)
+        meta_stats.append((name, score))
+
+    print(f"Meta champs ({role_key}): {meta_stats}")
+    if not meta_stats:
+        raise RuntimeError("Meta stats not found or empty")
+
+    meta_stats.sort(key=lambda x: -x[1])
+    return {name for name, _ in meta_stats[:count]}
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--enemy")
     ap.add_argument("--role")
     ap.add_argument("--pool")
-    ap.add_argument("--source", choices=["ugg", "lolalytics", "auto"], default="auto",
-                    help="preferred site (auto → U.GG then LoLalytics)")
     ns, _ = ap.parse_known_args()
     prompt_missing(ns)
 
-    pool = load_pool(pathlib.Path(ns.pool))
+    pool = get_user_champ_pool(pathlib.Path(ns.pool))
+
+    if not ns.enemy:
+        # comparable to u.gg S tiers mostly
+        meta_champs = get_meta_champs_ugg(ns.role)
+
+        best = get_best_blindpick_ugg(ns.role, frozenset(pool), frozenset(meta_champs))
+        print("\nBest blind-pick champs from your pool:")
+        print(tabulate(best, headers=["Champion", "Avg WR vs Meta (%)"], floatfmt=".2f"))
+
+        # doesn't lose badly into the most common meta champs
+        least_bad = get_least_bad_blindpick_ugg(ns.role,pool,meta_champs)
+        print("\nLeast bad blind-pick champs from your pool:")
+        print(tabulate(least_bad, headers=["Champion", "Worst WR vs Meta (%)"], floatfmt=".2f"))
+        return
+
+
     errors, pairs = [], []
-    order = ["ugg","opgg", "lolalytics"] if ns.source == "auto" else [ns.source]
-
-    for site in order:
-        try:
-
-            # if site == "opgg":
-            #     url = f"https://op.gg/lol/champions/{slugify_for_opgg(ns.enemy)}/counters/{ns.role}"
-            #
-            #     html = requests.get(
-            #         url,
-            #         headers=HEADERS,
-            #         timeout=10
-            #     ).text
-            #     pairs = parse_opgg(html)
-            # elif site == "lolalytics":
-            #     pairs = parse_lolalytics(fetch_lolalytics(ns.enemy, ns.role))
-            # elif site == "ugg":
-            pairs = parse_ugg(fetch_ugg(ns.enemy, ns.role))
-            break;
-        except Exception as e:
-            errors.append(f"{site}: {e}")
-            time.sleep(0.3)
-
+    pairs = parse_ugg(fetch_ugg(ns.enemy, ns.role))
     if not pairs:
-        sys.exit("All sources failed:\n  " + "\n  ".join(errors))
-
-    # filtered = [(c, w) for c, w in pairs if c.lower() in pool]
-
-    #  if exists?
+        sys.exit("source failed:\n  " + "\n  ".join(errors))
     filtered = [(c, v["wr"], v.get("gd15", "")) for c, v in pairs.items() if c.lower() in pool]
 
     if not filtered:
@@ -353,11 +307,8 @@ def main():
     print(f"\nBest picks **from your pool** vs {ns.enemy.title()} ({ns.role})\n")
 
     print(tabulate(filtered, headers=[
-        "Champion", f"Win-rate vs {ns.enemy.title()} (%)", "GD@15"
+        "Champion", f"Win-rate vs {ns.enemy.title()} (%)", f"Gold Ahead vs {ns.enemy.title()} @15"
     ], floatfmt=".2f"))
-    # print(tabulate(filtered, headers=[ "Champion",
-    #                                    f"Win-rate vs {ns.enemy.title()} (%)" ],
-    #                floatfmt=".2f"))
     print()
 
 
