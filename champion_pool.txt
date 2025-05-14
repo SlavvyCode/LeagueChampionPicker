@@ -9,5 +9,6 @@ Sett
 Volibear
 Yasuo
 Camille
+Nasus
 Fiora
 Sion
