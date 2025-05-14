@@ -7,12 +7,14 @@ from typing import List, Tuple
 import requests
 from bs4 import BeautifulSoup
 from tabulate import tabulate
+import difflib
 
+
+CACHE_BOOL = False
 CACHE_PERIOD = 60 * 60 * 24 * 3  # 3 days
 CACHE_DIR = ".cache"
 PARSED_CACHE_DIR = ".parsed_cache"
 os.makedirs(PARSED_CACHE_DIR, exist_ok=True)
-
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -26,6 +28,7 @@ HEADERS = {
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
+
 def slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9-]", "", name.lower().replace(" ", "-").replace("'", ""))
 
@@ -34,17 +37,67 @@ def get_user_champ_pool(path: pathlib.Path) -> frozenset[str]:
         sys.exit(f"champion-pool file '{path}' not found")
     return {c.strip().lower() for c in path.read_text().splitlines() if c.strip()}
 
-def prompt_missing(ns):
-    if not ns.enemy:
-        ns.enemy = input("Enemy champion: ").strip()
-    # if not ns.role:
-    #     ns.role = input("Role (top/jungle/mid/bot/support) [top]: ").strip() or "top"
-    # if not ns.pool:
-    #     d = "champion_pool.txt"
-    #     ns.pool = input(f"Champion-pool file [{d}]: ").strip() or d
+def load_champ_name_map() -> dict[str, str]:
+    """
+    Returns a dict mapping all aliases (normalised) → canonical name
+    Only one canonical name per champion (from 'name')
+    """
+    cache_path = ".champ_name_map.json"
+    if os.path.exists(cache_path):
+        return json.load(open(cache_path))
 
-        ns.role = "top"
-        ns.pool = "champion_pool.txt"
+    html = fetch_ugg("aatrox", "top", use_cache=True)
+    ssr  = extract_balanced_json(html, "window.__SSR_DATA__")
+
+    seo_block = next(block["data"] for url, block in ssr.items()
+                     if "seo-champion-names.json" in url)
+
+    alias_map = {}
+    for champ_data in seo_block.values():
+        canonical = champ_data.get("name")
+        if not canonical:
+            continue
+
+        for key in ("name", "altName", "altName2"):
+            alias = champ_data.get(key)
+            if alias:
+                norm = _normalise(alias)
+                alias_map[norm] = canonical
+
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(alias_map, f, ensure_ascii=False, indent=2)
+
+    return alias_map
+
+def _normalise(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+
+
+def resolve_champ_name(user_input: str, name_map: dict[str, str]) -> str:
+    """
+    Return canonical champion name from user input using exact and fuzzy match.
+    """
+    norm = _normalise(user_input)
+    if norm in name_map:
+        return name_map[norm]
+
+    # Fuzzy fallback
+    import difflib
+    guesses = difflib.get_close_matches(norm, name_map.keys(), n=1, cutoff=0.5)
+    if guesses:
+        return name_map[guesses[0]]
+
+    raise ValueError(f"Champion name '{user_input}' not recognised.")
+
+
+def prompt_missing(ns, CHAMP_NAME_MAP):
+    if not ns.enemy:
+        raw = input("Enemy champion: ").strip()
+        ns.enemy = resolve_champ_name(raw, CHAMP_NAME_MAP)
+    ns.role = "top"
+    ns.pool = "champion_pool.txt"
 
 
 
@@ -70,10 +123,6 @@ def _fetch_ugg_direct(enemy, role):
     r = requests.get(url, headers=HEADERS, timeout=10)
     r.raise_for_status()
     return r.text
-
-
-
-
 
 def extract_balanced_json(html: str, key: str) -> dict:
     start = html.find(key)
@@ -108,7 +157,7 @@ def extract_balanced_json(html: str, key: str) -> dict:
 
 
 
-def extract_lane_matchups(ssr_data: dict) -> list[tuple[str, float, float]]:
+def extract_lane_matchups(ssr_data: dict)  -> list[tuple[str, float, float, float]]:
     champ_id_to_name = {}
 
     for url, block in ssr_data.items():
@@ -130,26 +179,28 @@ def extract_lane_matchups(ssr_data: dict) -> list[tuple[str, float, float]]:
         (
             champ_id_to_name.get(c["champion_id"], f"#{c['champion_id']}"),
             round(100 - c.get("win_rate", 0), 2),
-            round(-c.get("gold_adv_15", 0), 2)
+            round(-c.get("gold_adv_15", 0), 2),
+            round(c.get("pick_rate", 0), 2)
         )
         for c in matchup_block if "gold_adv_15" in c
     ], key=lambda x: -x[1])
 
 
+
 def parse_ugg(html: str) -> dict[str, dict]:
     ssr = extract_balanced_json(html, "window.__SSR_DATA__")
-
     raw_pairs = extract_lane_matchups(ssr)
     return {
-        champ: {"wr": wr, "gd15": gd}
-        for champ, wr, gd in raw_pairs
+        champ: {"wr": wr, "gd15": gd, "pickrate": pick}
+        for champ, wr, gd, pick in raw_pairs
     }
+
 
 def load_parsed_ugg(enemy: str, role: str) -> dict[str, dict]:
     key = f"{enemy.lower()}_{role.lower()}"
     path = os.path.join(PARSED_CACHE_DIR, key + ".json")
 
-    if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < CACHE_PERIOD:
+    if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < CACHE_PERIOD and CACHE_BOOL == True:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
@@ -165,7 +216,6 @@ def load_parsed_ugg(enemy: str, role: str) -> dict[str, dict]:
 
 def get_best_blindpick_ugg(role: str, pool: frozenset[str], meta_champs: frozenset[str], rank: str = "gold") -> list[tuple[str, float]]:
     scores = {}  # {champ_in_pool: [winrates vs each meta champ]}
-
     for enemy in meta_champs:
         try:
             pairs = load_parsed_ugg(enemy, role)
@@ -175,7 +225,6 @@ def get_best_blindpick_ugg(role: str, pool: frozenset[str], meta_champs: frozens
                     scores.setdefault(champ, []).append(stats["wr"])
         except Exception:
             continue
-
     # Compute average winrate across meta champs matchups
     return sorted(
         [(champ.title(), sum(wrs)/len(wrs)) for champ, wrs in scores.items() if wrs],
@@ -269,13 +318,16 @@ def get_meta_champs_ugg(role: str, count: int = 15) -> frozenset[str]:
     return {name for name, _ in meta_stats[:count]}
 
 
+
+
 def main():
+    CHAMP_NAME_MAP = load_champ_name_map()
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--enemy")
     ap.add_argument("--role")
     ap.add_argument("--pool")
     ns, _ = ap.parse_known_args()
-    prompt_missing(ns)
+    prompt_missing(ns, CHAMP_NAME_MAP)
 
     pool = get_user_champ_pool(pathlib.Path(ns.pool))
 
