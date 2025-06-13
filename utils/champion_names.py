@@ -1,7 +1,7 @@
 import re, json
 import requests
-from .fetch import fetch_ugg
-from .parse_ssr import extract_json_from_html, get_ssr_subdata
+from .fetch_ugg import fetch_champ_counter_ugg
+from .parse_ugg_ssr import extract_json_from_html, get_ssr_subdata
 import difflib
 from utils.patch import get_current_patch
 
@@ -24,7 +24,7 @@ def load_champ_name_map() -> dict[str, dict]:
         pass  # cache miss
 
     # champion irrelevant to get this data
-    html = fetch_ugg("aatrox", "top")
+    html = fetch_champ_counter_ugg("aatrox", "top")
     ssr = extract_json_from_html(html, "window.__SSR_DATA__")
 
     # Official Riot champion data
@@ -61,8 +61,6 @@ def load_champ_name_map() -> dict[str, dict]:
         f.write(current_version)
 
     return alias_map
-
-
 
 def get_champ_name_variations(user_input: str, alias_map: dict[str, dict]) -> dict:
     """
